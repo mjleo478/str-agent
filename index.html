@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>STR Deal Map</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css" />
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+<style>
+  :root {
+    --ink: #0e2233;
+    --panel: #ffffff;
+    --line: #dfe4ea;
+    --muted: #5b6b7a;
+    --good: #128a5a;
+    --below: #8a97a6;
+    --accent: #0e2233;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: var(--ink);
+    display: flex; flex-direction: column;
+  }
+  header {
+    background: var(--ink); color: #fff;
+    padding: 12px 18px; display: flex; align-items: center;
+    gap: 18px; flex-wrap: wrap;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 650; letter-spacing: .2px; }
+  header .count { font-size: 13px; color: #b7c4d2; }
+  header .count b { color: #fff; }
+  header label { font-size: 13px; color: #dbe4ec; display: inline-flex; align-items: center; gap: 7px; cursor: pointer; margin-left: auto; }
+  header input { accent-color: var(--good); width: 15px; height: 15px; }
+  #map { flex: 1 1 auto; }
+  .msg {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
+    z-index: 500; background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 18px 22px; max-width: 340px; text-align: center;
+    box-shadow: 0 8px 30px rgba(14,34,51,.12); font-size: 14px; color: var(--muted);
+  }
+  .legend {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+    padding: 8px 11px; font-size: 12px; color: var(--muted); line-height: 1.7;
+    box-shadow: 0 2px 10px rgba(14,34,51,.10);
+  }
+  .legend .dot { display: inline-block; width: 11px; height: 11px; border-radius: 50%;
+    margin-right: 6px; vertical-align: -1px; border: 2px solid #fff; box-shadow: 0 0 0 1px var(--line); }
+  .pop { font-family: inherit; min-width: 220px; }
+  .pop .addr { font-weight: 650; font-size: 13.5px; color: var(--ink); margin-bottom: 2px; }
+  .pop .sub { font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+  .pop table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  .pop td { padding: 2px 0; }
+  .pop td:last-child { text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
+  .pop .coc-yes { color: var(--good); }
+  .pop .coc-no { color: #b4442f; }
+  .pop a.btn { display: block; margin-top: 9px; text-align: center; background: var(--ink);
+    color: #fff; text-decoration: none; padding: 7px; border-radius: 6px; font-size: 12.5px; font-weight: 600; }
+  .tag { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 20px; }
+  .tag.ok { background: #e2f3ea; color: var(--good); }
+  .tag.chk { background: #fdeede; color: #b06b13; }
+</style>
+</head>
+<body>
+<header>
+  <h1>STR Deal Map</h1>
+  <span class="count" id="count">Loading&hellip;</span>
+  <label><input type="checkbox" id="filter" /> Only homes that clear my floor</label>
+</header>
+<div id="map"></div>
+
+<script>
+const CSV_URL = "listings.csv";              // lives next to this page in the repo
+const CENTER = [28.30, -81.61];              // Four Corners belt
+let map, layer, allRows = [];
+
+function money(n) {
+  const v = Number(n);
+  if (!isFinite(v)) return "-";
+  return (v < 0 ? "-$" : "$") + Math.abs(v).toLocaleString();
+}
+
+function msg(text) {
+  let el = document.querySelector(".msg");
+  if (!el) { el = document.createElement("div"); el.className = "msg"; document.body.appendChild(el); }
+  el.innerHTML = text;
+}
+function clearMsg() { const el = document.querySelector(".msg"); if (el) el.remove(); }
+
+function popup(r) {
+  const clears = (r["Clears Floor"] || "").toLowerCase() === "yes";
+  const pool = (r["Pool"] || "");
+  const legal = (r["STR-legal"] || "");
+  const poolTag = pool.toLowerCase() === "yes"
+      ? '<span class="tag ok">Pool</span>' : '<span class="tag chk">Pool: verify</span>';
+  const legalTag = legal.toLowerCase() === "confirmed"
+      ? '<span class="tag ok">STR-legal</span>' : '<span class="tag chk">Verify HOA</span>';
+  return `<div class="pop">
+    <div class="addr">${r["Address"] || ""}</div>
+    <div class="sub">${r["Community"] || ""} &middot; ${r["Beds"]}BR / ${r["Baths"]}BA &middot; ${r["Miles to Disney"] || "?"} mi to Disney</div>
+    <table>
+      <tr><td>Price</td><td>${money(r["Price"])}</td></tr>
+      <tr><td>Est. Airbnb / yr</td><td>${money(r["Est Annual Airbnb"])}</td></tr>
+      <tr><td>Monthly cash flow</td><td>${money(r["Monthly Cash Flow"])}</td></tr>
+      <tr><td>Cash-on-cash</td><td class="${clears ? "coc-yes" : "coc-no"}">${r["Cash-on-Cash"] || "-"}</td></tr>
+      <tr><td>Cap rate</td><td>${r["Cap Rate"] || "-"}</td></tr>
+      <tr><td>Buy below (for $1k/mo)</td><td>${r["Target Buy Price"] || "-"}</td></tr>
+    </table>
+    <div style="margin-top:7px">${poolTag} ${legalTag}</div>
+    ${r["Listing Link"] ? `<a class="btn" href="${r["Listing Link"]}" target="_blank" rel="noopener">View listing</a>` : ""}
+  </div>`;
+}
+
+function draw(rows) {
+  if (layer) layer.remove();
+  layer = L.layerGroup().addTo(map);
+  const pts = [];
+  rows.forEach(r => {
+    const lat = parseFloat(r["Latitude"]), lng = parseFloat(r["Longitude"]);
+    if (!isFinite(lat) || !isFinite(lng)) return;
+    const clears = (r["Clears Floor"] || "").toLowerCase() === "yes";
+    L.circleMarker([lat, lng], {
+      radius: 8, color: "#fff", weight: 2,
+      fillColor: clears ? "#128a5a" : "#8a97a6", fillOpacity: 0.95
+    }).bindPopup(popup(r)).addTo(layer);
+    pts.push([lat, lng]);
+  });
+  document.getElementById("count").innerHTML = "<b>" + pts.length + "</b> home" + (pts.length === 1 ? "" : "s") + " shown";
+  if (pts.length) map.fitBounds(pts, { padding: [40, 40], maxZoom: 13 });
+}
+
+function render() {
+  const only = document.getElementById("filter").checked;
+  const rows = only ? allRows.filter(r => (r["Clears Floor"] || "").toLowerCase() === "yes") : allRows;
+  if (!allRows.length) { msg("No homes on the market fit your buy box right now. The map fills in as new listings appear."); return; }
+  clearMsg();
+  draw(rows);
+}
+
+function init() {
+  map = L.map("map", { zoomControl: true }).setView(CENTER, 11);
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 19, attribution: "&copy; OpenStreetMap"
+  }).addTo(map);
+
+  const legend = L.control({ position: "bottomright" });
+  legend.onAdd = function () {
+    const d = L.DomUtil.create("div", "legend");
+    d.innerHTML = '<span class="dot" style="background:#128a5a"></span>Clears your floor<br>'
+                + '<span class="dot" style="background:#8a97a6"></span>Below your floor';
+    return d;
+  };
+  legend.addTo(map);
+
+  document.getElementById("filter").addEventListener("change", render);
+
+  Papa.parse(CSV_URL + "?t=" + Date.now(), {
+    download: true, header: true, skipEmptyLines: true,
+    complete: (res) => { allRows = res.data.filter(r => r["Address"]); render(); },
+    error: () => msg("Could not load the listings file yet. Make sure the repo is public and the agent has run at least once to create listings.csv.")
+  });
+}
+init();
+</script>
+</body>
+</html>
