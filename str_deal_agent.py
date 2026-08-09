@@ -56,10 +56,14 @@ STR_COMMUNITIES = [
     "calabay parc", "sonoma resort", "veranda palms",
 ]
 
-# --- Notifications: only push a NEW home if it clears this return floor ---
-# This does NOT limit the live list. The sheet shows every home that fits your
-# size / baths / ZIP / price; this only decides which ones ping your phone.
-MIN_CASH_ON_CASH = 0.0    # 0.0 = only push money-makers; raise to 0.08 for target-only
+# --- Your floor: minimum MONTHLY cash flow in dollars ---
+# A home must clear at least this much profit per month to turn green on the map,
+# show "Yes" in the sheet, and ping your phone. This does NOT limit the live list:
+# every home that fits your size / baths / ZIP / price still shows (in gray).
+MIN_MONTHLY_CASHFLOW = 500    # your minimum; set to 1000 for your preferred target
+
+# --- Target used for the "price you'd need to pay" figure in each alert ---
+TARGET_MONTHLY = 1000    # the buy price shown is what hits THIS much cash flow
 
 # --- Disney reference (shown for each home) ---
 DISNEY_LAT = 28.3852
@@ -161,25 +165,35 @@ def rentcast_radius_listings():
         return []
 
 
-def airroi_str_revenue(lat, lng, beds):
+def airroi_str_revenue(lat, lng, beds, baths=0):
+    """Projected annual Airbnb revenue from AirROI's calculator/estimate endpoint.
+    Docs: airroi.com/api . Auth is the X-API-KEY header. Falls back to a
+    conservative seed on any failure so the agent keeps running."""
     try:
-        url = "https://api.airroi.com/v1/revenue"
-        params = {"latitude": lat, "longitude": lng,
-                  "bedrooms": beds, "api_key": AIRROI_API_KEY}
-        r = requests.get(url, params=params, timeout=30)
+        if lat is None or lng is None:
+            raise ValueError("missing coordinates")
+        guests = int(beds or 4) * 2 + 2            # group vacation homes sleep large
+        params = {"lat": lat, "lng": lng, "bedrooms": int(beds or 0),
+                  "guests": guests, "currency": "usd"}
+        if baths:
+            params["baths"] = baths
+        headers = {"X-API-KEY": AIRROI_API_KEY}
+        r = requests.get("https://api.airroi.com/calculator/estimate",
+                         params=params, headers=headers, timeout=30)
         if r.status_code == 200:
             data = r.json()
-            for key in ("annual_revenue", "annualRevenue", "revenue", "ltm_revenue"):
-                if data.get(key):
-                    return float(data[key])
-            adr = data.get("adr") or data.get("average_daily_rate")
-            occ = data.get("occupancy") or data.get("occupancy_rate")
+            if data.get("revenue"):
+                return float(data["revenue"])
+            adr, occ = data.get("average_daily_rate"), data.get("occupancy")
             if adr and occ:
                 occ = occ / 100.0 if occ > 1 else occ
                 return float(adr) * float(occ) * 365
+        else:
+            log("AirROI HTTP {}: {}".format(r.status_code, str(r.text)[:180]))
     except Exception as e:
-        log("AirROI error: {}; using seed.".format(e))
+        log("AirROI error: {}".format(e))
     b = min(max(int(beds or 4), 4), 7)
+    log("AirROI unavailable; using seed for {}BR.".format(b))
     return float(REVENUE_SEEDS.get(b, REVENUE_SEEDS[4]))
 
 
@@ -200,6 +214,29 @@ def annual_debt_service(price):
         return (loan / n) * 12
     pmt = loan * mr / (1 - math.pow(1 + mr, -n))
     return pmt * 12
+
+
+def hoa_annual_of(listing):
+    hoa = listing.get("hoa")
+    fee = float(hoa.get("fee")) if isinstance(hoa, dict) and hoa.get("fee") else 0
+    return (fee if fee else DEFAULT_HOA_MONTHLY) * 12
+
+
+def target_buy_price(annual_revenue, hoa_annual, target_monthly):
+    """Highest purchase price that still yields target_monthly cash flow.
+    Price drives both property tax and the financed mortgage, so both are in the
+    denominator. Returns None if the revenue is too low to hit the target at any
+    price."""
+    mr = INTEREST_RATE / 12.0
+    n = LOAN_TERM_YEARS * 12
+    annual_loan_constant = (mr / (1 - math.pow(1 + mr, -n))) * 12  # per $ of loan
+    per_dollar_cost = PROPERTY_TAX_RATE + (1 - DOWN_PAYMENT_PCT) * annual_loan_constant
+    variable = annual_revenue * (MGMT_PCT + MAINTENANCE_PCT)
+    fixed = INSURANCE_ANNUAL + hoa_annual + UTILITIES_ANNUAL
+    numerator = annual_revenue - variable - fixed - target_monthly * 12
+    if numerator <= 0:
+        return None
+    return numerator / per_dollar_cost
 
 
 def compute_economics(listing, annual_revenue):
@@ -246,7 +283,8 @@ def send_pushover(title, message, url=None):
 CSV_HEADER = ["Address", "Community", "STR-legal", "Beds", "Baths", "Price",
               "Est Annual Airbnb", "Monthly Cash Flow", "Cash-on-Cash",
               "Cap Rate", "Clears Floor", "Miles to Disney", "Pool",
-              "Listing Link", "First Seen"]
+              "Listing Link", "First Seen", "Latitude", "Longitude",
+              "Target Buy Price"]
 
 
 def write_csv(rows):
@@ -301,7 +339,8 @@ def main():
         if not matches_icp(lst):
             continue
         revenue = airroi_str_revenue(lst.get("latitude"), lst.get("longitude"),
-                                     int(lst.get("bedrooms") or 0))
+                                     int(lst.get("bedrooms") or 0),
+                                     lst.get("bathrooms") or 0)
         econ = compute_economics(lst, revenue)
         if not econ:
             continue
@@ -315,6 +354,7 @@ def main():
         baths = lst.get("bathrooms") or ""
         price = float(lst.get("price") or 0)
         coc = econ["cash_on_cash"]
+        mcf = econ["monthly_cash_flow"]
         d = haversine_miles(lst.get("latitude"), lst.get("longitude"), DISNEY_LAT, DISNEY_LNG)
         link = "https://www.zillow.com/homes/{}_rb/".format(
             address.replace(" ", "-").replace(",", ""))
@@ -324,22 +364,32 @@ def main():
         if listing_id:
             seen[listing_id] = first_seen
 
-        clears = "Yes" if coc >= MIN_CASH_ON_CASH else "No"
+        clears = "Yes" if mcf >= MIN_MONTHLY_CASHFLOW else "No"
+        tp = target_buy_price(revenue, hoa_annual_of(lst), TARGET_MONTHLY)
+        tp_str = money(tp) if tp else "revenue too low"
         current.append([
             address, community, legal, beds, baths, int(price),
-            int(econ["annual_revenue"]), int(econ["monthly_cash_flow"]),
+            int(econ["annual_revenue"]), int(mcf),
             "{:.1%}".format(coc), "{:.1%}".format(econ["cap_rate"]), clears,
             ("{:.1f}".format(d) if d is not None else ""),
             pool_flag(lst), link, first_seen,
+            lst.get("latitude") or "", lst.get("longitude") or "", tp_str,
         ])
 
-        if is_new and coc >= MIN_CASH_ON_CASH:
-            title = "New: {}BR {} ({:.0%} CoC)".format(beds, community, coc)
+        if is_new and mcf >= MIN_MONTHLY_CASHFLOW:
+            if tp and price <= tp:
+                tline = "Already clears ${:,}/mo".format(TARGET_MONTHLY)
+            elif tp:
+                tline = "For ${:,}/mo, buy at/below {}".format(TARGET_MONTHLY, money(tp))
+            else:
+                tline = "Cannot reach ${:,}/mo at this revenue".format(TARGET_MONTHLY)
+            title = "New: {}BR {} ({}/mo)".format(beds, community, money(mcf))
             msg = ("{addr}\n{price} | {beds}BR/{baths}BA | {legal}\n"
-                   "Airbnb ~{rev}/yr | CoC {coc:.1%} | {mcf}/mo").format(
+                   "Airbnb ~{rev}/yr | {mcf}/mo | CoC {coc:.1%}\n"
+                   "{tline}").format(
                 addr=address, price=money(price), beds=beds, baths=baths,
                 legal=legal, rev=money(econ["annual_revenue"]), coc=coc,
-                mcf=money(econ["monthly_cash_flow"]))
+                mcf=money(mcf), tline=tline)
             send_pushover(title, msg, link)
             new_alerts += 1
 
