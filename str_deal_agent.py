@@ -27,10 +27,13 @@ import requests
 # CONFIG  -  the only part you normally edit
 # =====================================================================
 
-# --- Search area: one radius query centered on Celebration ---
-CENTER_LAT = 28.3255
-CENTER_LNG = -81.5301
-RADIUS_MILES = 10
+# --- Search area: one radius query centered on WALT DISNEY WORLD ---
+# Centered on Disney and focused on the closer-in communities on your
+# (Orlando-facing) side. The community whitelist below is what actually
+# decides which communities alert, so edit that to widen or narrow the area.
+CENTER_LAT = 28.3852
+CENTER_LNG = -81.5639
+RADIUS_MILES = 8
 
 # --- Your ICP ---
 # Recommendation from market data: 6 bedrooms is the profit sweet spot.
@@ -43,18 +46,22 @@ MAX_PRICE = 1100000
 ALLOWED_TYPES = ["Single Family", "Townhouse", "Condo"]
 
 # --- STR-legal community whitelist (lowercase; substring match on address) ---
+# Active = the closer-in communities on your side of Disney.
+# The farther southwest / Davenport communities are intentionally left OUT.
+# If alerts get too sparse, move any name up from the "optional" block.
 STR_COMMUNITIES = [
-    "reunion", "encore", "championsgate", "champions gate",
-    "windsor hills", "windsor at westside", "windsor island",
-    "storey lake", "solara", "sonoma resort", "margaritaville",
-    "sunset walk", "bella vida", "emerald island", "paradise palms",
-    "terra verde", "seven dwarfs", "solterra", "veranda palms",
+    "storey lake", "windsor hills", "margaritaville", "sunset walk",
+    "emerald island", "paradise palms", "terra verde", "bella vida",
+    "seven dwarfs", "reunion", "encore",
+    # ---- optional: farther out / Davenport (add back if you want them) ----
+    # "championsgate", "champions gate", "windsor at westside",
+    # "windsor island", "solara", "solterra", "veranda palms", "sonoma resort",
 ]
 WHITELIST_ONLY = True   # only alert inside these communities (recommended)
 
 # --- Should a match still clear your return threshold to alert you? ---
-REQUIRE_PROFIT_GATE = False   # False = alert on any ICP match; return is shown
-MIN_CASH_ON_CASH = 0.08       # used only if REQUIRE_PROFIT_GATE is True
+REQUIRE_PROFIT_GATE = True    # True = only alert if it clears the floor below
+MIN_CASH_ON_CASH = 0.0        # 0.0 = block money-losers; raise to 0.08 for target-only
 
 # --- Disney proximity (shown in every alert; optional hard filter) ---
 DISNEY_LAT = 28.3852
