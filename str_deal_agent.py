@@ -1,24 +1,21 @@
 """
-STR Deal Agent - Celebration, FL area (Disney vacation-home corridor)
-ICP-match version
+STR Deal Agent - Four Corners / Windsor Hills area (Disney vacation-home corridor)
+Live-list version
 
-Trigger: the moment a NEW for-sale listing appears that matches your Ideal
-property Profile (location + bedroom band + bathrooms + price/type), you get a
-Pushover alert. Profitability (cash-on-cash) rides along inside the alert.
+Each hourly run it:
+  1. Pulls active for-sale listings around the Four Corners belt from RentCast.
+  2. Keeps the ones in your target ZIP codes that fit your ICP and clear your
+     return floor.
+  3. Estimates Airbnb revenue and models the economics for each.
+  4. Writes the FULL current list to listings.csv (best deals on top). Homes
+     that sell drop off automatically, because they stop showing as active.
+  5. Sends a Pushover alert for any home that is brand-new since the last run.
 
-Runs hourly on GitHub Actions. One radius query around Celebration keeps the
-API call count low.
-
-Amenity reality: beds, baths, location, and Disney distance are matched exactly.
-Pool, hot tub, and game room usually live only in the listing's marketing text,
-which is not reliably in the data feed, so they show as "yes / verify" flags in
-the alert rather than hard filters. That way you never miss a great home just
-because its game room was not tagged.
+listings.csv is what feeds your live Google Sheet. Edit the CONFIG block below.
 """
 
 import os
-import json
-import time
+import csv
 import math
 import datetime
 import requests
@@ -27,54 +24,53 @@ import requests
 # CONFIG  -  the only part you normally edit
 # =====================================================================
 
-# --- Search area: one radius query centered on WALT DISNEY WORLD ---
-# Centered on Disney and focused on the closer-in communities on your
-# (Orlando-facing) side. The community whitelist below is what actually
-# decides which communities alert, so edit that to widen or narrow the area.
-CENTER_LAT = 28.3852
-CENTER_LNG = -81.5639
-RADIUS_MILES = 8
+# --- Search area: one radius query that covers the Four Corners belt ---
+CENTER_LAT = 28.30
+CENTER_LNG = -81.61
+RADIUS_MILES = 10
+
+# --- Target ZIP codes (this is the real area filter) ---
+# 34747 = Kissimmee / Four Corners: Windsor Hills, Acadia Estates, Reunion, Formosa Gardens (closest)
+# 33896 = Davenport / ChampionsGate
+# 34714 = Clermont / Four Corners (Lake County)
+# 33897 = Davenport West / Four Corners
+# 33837 = Davenport / Citrus Ridge (farthest; delete this line if too far)
+TARGET_ZIPS = ["34747", "33896", "34714", "33897", "33837"]
 
 # --- Your ICP ---
-# Recommendation from market data: 6 bedrooms is the profit sweet spot.
-# Band is set to 4-7 so you also see strong 4-5BR balance plays and can compare
-# returns. To hunt only the sweet spot, set MIN_BEDS = 6.
 MIN_BEDS = 4
 MAX_BEDS = 7
-MIN_BATHS = 3
+MIN_BATHS = 4          # you asked for 4+; lower to 3 if the list is too thin
 MAX_PRICE = 1100000
 ALLOWED_TYPES = ["Single Family", "Townhouse", "Condo"]
 
-# --- STR-legal community whitelist (lowercase; substring match on address) ---
-# Active = the closer-in communities on your side of Disney.
-# The farther southwest / Davenport communities are intentionally left OUT.
-# If alerts get too sparse, move any name up from the "optional" block.
+# --- Known STR-legal communities (used to flag each home, not to filter) ---
+# A home in a target ZIP that matches one of these is flagged "Confirmed".
+# Anything else is flagged "Verify HOA" so you check before making an offer.
 STR_COMMUNITIES = [
-    "storey lake", "windsor hills", "margaritaville", "sunset walk",
-    "emerald island", "paradise palms", "terra verde", "bella vida",
-    "seven dwarfs", "reunion", "encore",
-    # ---- optional: farther out / Davenport (add back if you want them) ----
-    # "championsgate", "champions gate", "windsor at westside",
-    # "windsor island", "solara", "solterra", "veranda palms", "sonoma resort",
+    "windsor hills", "acadia", "reunion", "encore", "storey lake",
+    "margaritaville", "sunset walk", "emerald island", "paradise palms",
+    "formosa gardens", "terra verde", "seven dwarfs", "bella vida",
+    "championsgate", "champions gate", "windsor at westside", "windsor island",
+    "solara", "solterra", "west haven", "legacy park", "highlands reserve",
+    "calabay parc", "sonoma resort", "veranda palms",
 ]
-WHITELIST_ONLY = True   # only alert inside these communities (recommended)
 
-# --- Should a match still clear your return threshold to alert you? ---
-REQUIRE_PROFIT_GATE = True    # True = only alert if it clears the floor below
-MIN_CASH_ON_CASH = 0.0        # 0.0 = block money-losers; raise to 0.08 for target-only
+# --- Notifications: only push a NEW home if it clears this return floor ---
+# This does NOT limit the live list. The sheet shows every home that fits your
+# size / baths / ZIP / price; this only decides which ones ping your phone.
+MIN_CASH_ON_CASH = 0.0    # 0.0 = only push money-makers; raise to 0.08 for target-only
 
-# --- Disney proximity (shown in every alert; optional hard filter) ---
+# --- Disney reference (shown for each home) ---
 DISNEY_LAT = 28.3852
 DISNEY_LNG = -81.5639
-FILTER_BY_DISNEY_DISTANCE = False   # True = require within the miles below
-MAX_DISNEY_MILES = 5
 
 # --- Cost / financing assumptions (edit to your situation) ---
 DOWN_PAYMENT_PCT   = 0.25
-INTEREST_RATE      = 0.07     # check today's investment-loan rate
+INTEREST_RATE      = 0.07
 LOAN_TERM_YEARS    = 30
 CLOSING_COST_PCT   = 0.03
-FURNISHING_COST    = 35000    # 6BR themed home furnishing runs higher
+FURNISHING_COST    = 35000
 PROPERTY_TAX_RATE  = 0.011
 INSURANCE_ANNUAL   = 3800
 DEFAULT_HOA_MONTHLY = 500
@@ -82,10 +78,10 @@ UTILITIES_ANNUAL   = 5400
 MGMT_PCT           = 0.22
 MAINTENANCE_PCT    = 0.05
 
-# --- STR revenue SEED values by bedroom (annual gross). AirROI replaces these. ---
 REVENUE_SEEDS = {4: 48000, 5: 58000, 6: 72000, 7: 84000}
 
 STATE_FILE = "seen.json"
+CSV_FILE = "listings.csv"
 
 RENTCAST_API_KEY = os.environ.get("RENTCAST_API_KEY", "")
 AIRROI_API_KEY   = os.environ.get("AIRROI_API_KEY", "")
@@ -97,22 +93,28 @@ PUSHOVER_USER    = os.environ.get("PUSHOVER_USER", "")
 # Helpers
 # =====================================================================
 
+import json
+
 def log(msg):
     stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print("[{}] {}".format(stamp, msg), flush=True)
 
 
 def load_seen():
+    """Return a dict of {listing_id: first_seen_date}."""
     try:
         with open(STATE_FILE, "r") as f:
-            return set(json.load(f))
+            data = json.load(f)
+            if isinstance(data, dict):
+                return data
+            return {str(x): "" for x in data}   # migrate old list format
     except Exception:
-        return set()
+        return {}
 
 
 def save_seen(seen):
     with open(STATE_FILE, "w") as f:
-        json.dump(sorted(seen), f, indent=2)
+        json.dump(seen, f, indent=2)
 
 
 def haversine_miles(lat1, lng1, lat2, lng2):
@@ -143,15 +145,9 @@ def money(x):
 # =====================================================================
 
 def rentcast_radius_listings():
-    """One radius query for active for-sale listings around Celebration."""
     url = "https://api.rentcast.io/v1/listings/sale"
-    params = {
-        "latitude": CENTER_LAT,
-        "longitude": CENTER_LNG,
-        "radius": RADIUS_MILES,
-        "status": "Active",
-        "limit": 500,
-    }
+    params = {"latitude": CENTER_LAT, "longitude": CENTER_LNG,
+              "radius": RADIUS_MILES, "status": "Active", "limit": 500}
     headers = {"X-Api-Key": RENTCAST_API_KEY, "Accept": "application/json"}
     try:
         r = requests.get(url, params=params, headers=headers, timeout=40)
@@ -166,7 +162,6 @@ def rentcast_radius_listings():
 
 
 def airroi_str_revenue(lat, lng, beds):
-    """Annual Airbnb gross revenue near a point. Falls back to seeds on failure."""
     try:
         url = "https://api.airroi.com/v1/revenue"
         params = {"latitude": lat, "longitude": lng,
@@ -188,14 +183,9 @@ def airroi_str_revenue(lat, lng, beds):
     return float(REVENUE_SEEDS.get(b, REVENUE_SEEDS[4]))
 
 
-def amenity_flags(listing):
-    """Return dict of amenity status: 'yes' if found in data, else 'verify'."""
+def pool_flag(listing):
     text = json.dumps(listing).lower()
-    flags = {}
-    flags["pool"] = "yes" if ('"pool": true' in text or "pool" in text) else "verify"
-    flags["hot tub"] = "yes" if ("hot tub" in text or "spa" in text) else "verify"
-    flags["game room"] = "yes" if "game room" in text else "verify"
-    return flags
+    return "Yes" if ('"pool": true' in text or "pool" in text) else "Verify"
 
 
 # =====================================================================
@@ -219,17 +209,14 @@ def compute_economics(listing, annual_revenue):
     hoa = listing.get("hoa")
     hoa_fee = float(hoa.get("fee")) if isinstance(hoa, dict) and hoa.get("fee") else 0
     hoa_annual = (hoa_fee if hoa_fee else DEFAULT_HOA_MONTHLY) * 12
-
     operating = (annual_revenue * MGMT_PCT + annual_revenue * MAINTENANCE_PCT
                  + price * PROPERTY_TAX_RATE + INSURANCE_ANNUAL
                  + hoa_annual + UTILITIES_ANNUAL)
     noi = annual_revenue - operating
     cash_flow = noi - annual_debt_service(price)
     cash_invested = price * DOWN_PAYMENT_PCT + price * CLOSING_COST_PCT + FURNISHING_COST
-
     return {
         "annual_revenue": annual_revenue,
-        "noi": noi,
         "monthly_cash_flow": cash_flow / 12.0,
         "cash_invested": cash_invested,
         "cash_on_cash": cash_flow / cash_invested if cash_invested else 0,
@@ -238,7 +225,7 @@ def compute_economics(listing, annual_revenue):
 
 
 # =====================================================================
-# Alerts
+# Alerts + CSV
 # =====================================================================
 
 def send_pushover(title, message, url=None):
@@ -256,34 +243,46 @@ def send_pushover(title, message, url=None):
         log("Pushover error: {}".format(e))
 
 
+CSV_HEADER = ["Address", "Community", "STR-legal", "Beds", "Baths", "Price",
+              "Est Annual Airbnb", "Monthly Cash Flow", "Cash-on-Cash",
+              "Cap Rate", "Clears Floor", "Miles to Disney", "Pool",
+              "Listing Link", "First Seen"]
+
+
+def write_csv(rows):
+    with open(CSV_FILE, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(CSV_HEADER)
+        for r in rows:
+            w.writerow(r)
+
+
 # =====================================================================
-# Main
+# ICP
 # =====================================================================
 
 def matches_icp(lst):
-    """Return (True, reason) if the listing fits the ICP, else (False, reason)."""
     price = float(lst.get("price") or 0)
     beds = int(lst.get("bedrooms") or 0)
     baths = float(lst.get("bathrooms") or 0)
     ptype = lst.get("propertyType") or ""
-    address = lst.get("formattedAddress") or lst.get("addressLine1") or ""
-
+    zipc = str(lst.get("zipCode") or "")
+    if TARGET_ZIPS and zipc not in TARGET_ZIPS:
+        return False
     if price <= 0 or price > MAX_PRICE:
-        return False, "price"
+        return False
     if beds < MIN_BEDS or beds > MAX_BEDS:
-        return False, "beds"
+        return False
     if baths < MIN_BATHS:
-        return False, "baths"
+        return False
     if ALLOWED_TYPES and ptype not in ALLOWED_TYPES:
-        return False, "type"
-    if WHITELIST_ONLY and not community_match(address):
-        return False, "community"
-    if FILTER_BY_DISNEY_DISTANCE:
-        d = haversine_miles(lst.get("latitude"), lst.get("longitude"), DISNEY_LAT, DISNEY_LNG)
-        if d is None or d > MAX_DISNEY_MILES:
-            return False, "disney"
-    return True, "match"
+        return False
+    return True
 
+
+# =====================================================================
+# Main
+# =====================================================================
 
 def main():
     if not RENTCAST_API_KEY:
@@ -291,66 +290,65 @@ def main():
         return
 
     seen = load_seen()
-    new_seen = set(seen)
-    alerts = 0
-
+    today = datetime.date.today().isoformat()
     listings = rentcast_radius_listings()
     log("Fetched {} active listings in radius.".format(len(listings)))
 
+    current = []     # rows for the CSV
+    new_alerts = 0
+
     for lst in listings:
-        listing_id = str(lst.get("id") or lst.get("formattedAddress") or "")
-        if not listing_id or listing_id in seen:
+        if not matches_icp(lst):
             continue
-
-        ok, reason = matches_icp(lst)
-        new_seen.add(listing_id)   # mark seen either way, so we do not re-check
-        if not ok:
-            continue
-
-        address = lst.get("formattedAddress") or lst.get("addressLine1") or ""
-        beds = int(lst.get("bedrooms") or 0)
-        baths = lst.get("bathrooms") or "?"
-        price = float(lst.get("price") or 0)
-        community = community_match(address) or "unverified"
-
-        revenue = airroi_str_revenue(lst.get("latitude"), lst.get("longitude"), beds)
+        revenue = airroi_str_revenue(lst.get("latitude"), lst.get("longitude"),
+                                     int(lst.get("bedrooms") or 0))
         econ = compute_economics(lst, revenue)
         if not econ:
             continue
 
+        listing_id = str(lst.get("id") or lst.get("formattedAddress") or "")
+        address = lst.get("formattedAddress") or lst.get("addressLine1") or ""
+        matched = community_match(address)
+        community = (matched.title() if matched else (lst.get("city") or "Unknown"))
+        legal = "Confirmed" if matched else "Verify HOA"
+        beds = int(lst.get("bedrooms") or 0)
+        baths = lst.get("bathrooms") or ""
+        price = float(lst.get("price") or 0)
         coc = econ["cash_on_cash"]
-        if REQUIRE_PROFIT_GATE and coc < MIN_CASH_ON_CASH:
-            log("ICP match below return gate: {} ({:.1%})".format(address, coc))
-            continue
-
         d = haversine_miles(lst.get("latitude"), lst.get("longitude"), DISNEY_LAT, DISNEY_LNG)
-        am = amenity_flags(lst)
-
-        title = "ICP match: {}BR in {}".format(beds, community.title())
-        msg = (
-            "{addr}\n"
-            "{price} | {beds}BR/{baths}BA\n"
-            "Disney: {dist} mi\n"
-            "Pool: {pool} | Hot tub: {tub} | Game room: {game}\n"
-            "Est. Airbnb: {rev}/yr\n"
-            "Cash-on-cash: {coc:.1%} | Cap: {cap:.1%}\n"
-            "Monthly cash flow: {mcf}\n"
-            "Cash to close: {cash}"
-        ).format(
-            addr=address, price=money(price), beds=beds, baths=baths,
-            dist=("{:.1f}".format(d) if d is not None else "?"),
-            pool=am["pool"], tub=am["hot tub"], game=am["game room"],
-            rev=money(econ["annual_revenue"]), coc=coc, cap=econ["cap_rate"],
-            mcf=money(econ["monthly_cash_flow"]), cash=money(econ["cash_invested"]),
-        )
-        zurl = "https://www.zillow.com/homes/{}_rb/".format(
+        link = "https://www.zillow.com/homes/{}_rb/".format(
             address.replace(" ", "-").replace(",", ""))
-        send_pushover(title, msg, zurl)
-        alerts += 1
-        log("ALERT: {} | {}BR | CoC {:.1%}".format(address, beds, coc))
 
-    save_seen(new_seen)
-    log("Run complete. {} new alerts.".format(alerts))
+        is_new = listing_id and listing_id not in seen
+        first_seen = today if is_new else seen.get(listing_id, today)
+        if listing_id:
+            seen[listing_id] = first_seen
+
+        clears = "Yes" if coc >= MIN_CASH_ON_CASH else "No"
+        current.append([
+            address, community, legal, beds, baths, int(price),
+            int(econ["annual_revenue"]), int(econ["monthly_cash_flow"]),
+            "{:.1%}".format(coc), "{:.1%}".format(econ["cap_rate"]), clears,
+            ("{:.1f}".format(d) if d is not None else ""),
+            pool_flag(lst), link, first_seen,
+        ])
+
+        if is_new and coc >= MIN_CASH_ON_CASH:
+            title = "New: {}BR {} ({:.0%} CoC)".format(beds, community, coc)
+            msg = ("{addr}\n{price} | {beds}BR/{baths}BA | {legal}\n"
+                   "Airbnb ~{rev}/yr | CoC {coc:.1%} | {mcf}/mo").format(
+                addr=address, price=money(price), beds=beds, baths=baths,
+                legal=legal, rev=money(econ["annual_revenue"]), coc=coc,
+                mcf=money(econ["monthly_cash_flow"]))
+            send_pushover(title, msg, link)
+            new_alerts += 1
+
+    # best deals on top (sort by the Cash-on-Cash column)
+    current.sort(key=lambda r: float(r[8].rstrip("%")), reverse=True)
+    write_csv(current)
+    save_seen(seen)
+    log("Wrote {} current listings to {}. {} new alerts.".format(
+        len(current), CSV_FILE, new_alerts))
 
 
 if __name__ == "__main__":
