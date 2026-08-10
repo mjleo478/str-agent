@@ -30,12 +30,13 @@ CENTER_LNG = -81.61
 RADIUS_MILES = 10
 
 # --- Target ZIP codes (this is the real area filter) ---
-# 34747 = Kissimmee / Four Corners: Windsor Hills, Acadia Estates, Reunion, Formosa Gardens (closest)
-# 33896 = Davenport / ChampionsGate
-# 34714 = Clermont / Four Corners (Lake County)
-# 33897 = Davenport West / Four Corners
-# 33837 = Davenport / Citrus Ridge (farthest; delete this line if too far)
+# All Disney-corridor ZIPs are IN, so standout deals never get hidden. Each home
+# is tagged by "Side" (SR-429 / Disney vs US-27) so you can prefer the 429 side
+# while still seeing high-yield US-27 homes like the Lake Davenport one.
+#   SR-429 side: 34747 (Windsor Hills, Acadia, Reunion, Storey Lake), 33896 (ChampionsGate)
+#   US-27 side:  33897, 33837 (Citrus Ridge / Davenport), 34714 (Clermont)
 TARGET_ZIPS = ["34747", "33896", "34714", "33897", "33837"]
+SIDE_429_ZIPS = {"34747", "33896"}   # anything not in here is tagged US-27 side
 
 # --- Your ICP ---
 MIN_BEDS = 4
@@ -84,6 +85,12 @@ MAINTENANCE_PCT    = 0.05
 
 REVENUE_SEEDS = {4: 48000, 5: 58000, 6: 72000, 7: 84000}
 
+# --- Cost guard for the paid AirROI calls ---
+# Each home's revenue is looked up once and cached, so runs after the first make
+# almost no paid calls. This cap bounds the worst case per run no matter what.
+MAX_AIRROI_CALLS_PER_RUN = 30
+CACHE_FILE = "revenue_cache.json"
+
 STATE_FILE = "seen.json"
 CSV_FILE = "listings.csv"
 
@@ -119,6 +126,20 @@ def load_seen():
 def save_seen(seen):
     with open(STATE_FILE, "w") as f:
         json.dump(seen, f, indent=2)
+
+
+def load_revenue_cache():
+    """listing_id -> revenue, so each home is priced by AirROI only once ever."""
+    try:
+        with open(CACHE_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_revenue_cache(cache):
+    with open(CACHE_FILE, "w") as f:
+        json.dump(cache, f, indent=2)
 
 
 def haversine_miles(lat1, lng1, lat2, lng2):
@@ -280,8 +301,8 @@ def send_pushover(title, message, url=None):
         log("Pushover error: {}".format(e))
 
 
-CSV_HEADER = ["Address", "Community", "STR-legal", "Beds", "Baths", "Price",
-              "Est Annual Airbnb", "Monthly Cash Flow", "Cash-on-Cash",
+CSV_HEADER = ["Address", "Community", "STR-legal", "Side", "Beds", "Baths",
+              "Price", "Est Annual Airbnb", "Monthly Cash Flow", "Cash-on-Cash",
               "Cap Rate", "Clears Floor", "Miles to Disney", "Pool",
               "Listing Link", "First Seen", "Latitude", "Longitude",
               "Target Buy Price"]
@@ -293,6 +314,35 @@ def write_csv(rows):
         w.writerow(CSV_HEADER)
         for r in rows:
             w.writerow(r)
+
+
+ALERTS_FILE = "alerts.csv"
+ALERTS_HEADER = ["Date Alerted", "Address", "Community", "Side", "Beds", "Baths",
+                 "Price", "Est Annual Airbnb", "Monthly Cash Flow", "Cash-on-Cash",
+                 "Target Buy Price", "Listing Link", "Listing ID"]
+
+
+def load_alert_ids():
+    """Ids of homes already in the permanent alert history, so we log each once."""
+    ids = set()
+    try:
+        with open(ALERTS_FILE, newline="") as f:
+            for row in csv.DictReader(f):
+                if row.get("Listing ID"):
+                    ids.add(row["Listing ID"])
+    except Exception:
+        pass
+    return ids
+
+
+def append_alert(row):
+    """Append one home to the permanent alert history (never removed)."""
+    new_file = not os.path.exists(ALERTS_FILE)
+    with open(ALERTS_FILE, "a", newline="") as f:
+        w = csv.writer(f)
+        if new_file:
+            w.writerow(ALERTS_HEADER)
+        w.writerow(row)
 
 
 # =====================================================================
@@ -328,6 +378,9 @@ def main():
         return
 
     seen = load_seen()
+    alerted_ids = load_alert_ids()
+    cache = load_revenue_cache()          # listing_id -> revenue, so we never re-pay
+    airroi_calls = 0
     today = datetime.date.today().isoformat()
     listings = rentcast_radius_listings()
     log("Fetched {} active listings in radius.".format(len(listings)))
@@ -338,14 +391,28 @@ def main():
     for lst in listings:
         if not matches_icp(lst):
             continue
-        revenue = airroi_str_revenue(lst.get("latitude"), lst.get("longitude"),
-                                     int(lst.get("bedrooms") or 0),
-                                     lst.get("bathrooms") or 0)
+        listing_id = str(lst.get("id") or lst.get("formattedAddress") or "")
+        beds = int(lst.get("bedrooms") or 0)
+
+        # Only pay AirROI once per home. Reuse the cached number after that, and
+        # never exceed the per-run cap, so cost stays tiny and bounded.
+        if listing_id and listing_id in cache:
+            revenue = cache[listing_id]
+        elif airroi_calls < MAX_AIRROI_CALLS_PER_RUN:
+            revenue = airroi_str_revenue(lst.get("latitude"), lst.get("longitude"),
+                                         beds, lst.get("bathrooms") or 0)
+            airroi_calls += 1
+            if listing_id:
+                cache[listing_id] = revenue
+        else:
+            b = min(max(beds, 4), 7)
+            revenue = float(REVENUE_SEEDS.get(b, REVENUE_SEEDS[4]))
+            log("Per-run AirROI cap reached; using seed for a home.")
+
         econ = compute_economics(lst, revenue)
         if not econ:
             continue
 
-        listing_id = str(lst.get("id") or lst.get("formattedAddress") or "")
         address = lst.get("formattedAddress") or lst.get("addressLine1") or ""
         matched = community_match(address)
         community = (matched.title() if matched else (lst.get("city") or "Unknown"))
@@ -355,6 +422,8 @@ def main():
         price = float(lst.get("price") or 0)
         coc = econ["cash_on_cash"]
         mcf = econ["monthly_cash_flow"]
+        zipc = str(lst.get("zipCode") or "")
+        side = "SR-429" if zipc in SIDE_429_ZIPS else "US-27"
         d = haversine_miles(lst.get("latitude"), lst.get("longitude"), DISNEY_LAT, DISNEY_LNG)
         link = "https://www.zillow.com/homes/{}_rb/".format(
             address.replace(" ", "-").replace(",", ""))
@@ -368,7 +437,7 @@ def main():
         tp = target_buy_price(revenue, hoa_annual_of(lst), TARGET_MONTHLY)
         tp_str = money(tp) if tp else "revenue too low"
         current.append([
-            address, community, legal, beds, baths, int(price),
+            address, community, legal, side, beds, baths, int(price),
             int(econ["annual_revenue"]), int(mcf),
             "{:.1%}".format(coc), "{:.1%}".format(econ["cap_rate"]), clears,
             ("{:.1f}".format(d) if d is not None else ""),
@@ -383,22 +452,28 @@ def main():
                 tline = "For ${:,}/mo, buy at/below {}".format(TARGET_MONTHLY, money(tp))
             else:
                 tline = "Cannot reach ${:,}/mo at this revenue".format(TARGET_MONTHLY)
-            title = "New: {}BR {} ({}/mo)".format(beds, community, money(mcf))
-            msg = ("{addr}\n{price} | {beds}BR/{baths}BA | {legal}\n"
+            title = "New: {}BR {} {} ({}/mo)".format(beds, community, side, money(mcf))
+            msg = ("{addr}\n{price} | {beds}BR/{baths}BA | {side} side | {legal}\n"
                    "Airbnb ~{rev}/yr | {mcf}/mo | CoC {coc:.1%}\n"
                    "{tline}").format(
                 addr=address, price=money(price), beds=beds, baths=baths,
-                legal=legal, rev=money(econ["annual_revenue"]), coc=coc,
+                side=side, legal=legal, rev=money(econ["annual_revenue"]), coc=coc,
                 mcf=money(mcf), tline=tline)
             send_pushover(title, msg, link)
             new_alerts += 1
+            if listing_id and listing_id not in alerted_ids:
+                append_alert([today, address, community, side, beds, baths,
+                              int(price), int(econ["annual_revenue"]), int(mcf),
+                              "{:.1%}".format(coc), tp_str, link, listing_id])
+                alerted_ids.add(listing_id)
 
-    # best deals on top (sort by the Cash-on-Cash column)
-    current.sort(key=lambda r: float(r[8].rstrip("%")), reverse=True)
+    # best deals on top (sort by monthly cash flow in dollars, now column index 8)
+    current.sort(key=lambda r: r[8], reverse=True)
     write_csv(current)
     save_seen(seen)
-    log("Wrote {} current listings to {}. {} new alerts.".format(
-        len(current), CSV_FILE, new_alerts))
+    save_revenue_cache(cache)
+    log("Wrote {} listings. {} new alerts. {} paid AirROI calls this run.".format(
+        len(current), new_alerts, airroi_calls))
 
 
 if __name__ == "__main__":
