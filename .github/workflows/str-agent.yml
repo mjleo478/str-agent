@@ -40,6 +40,6 @@ jobs:
         run: |
           git config user.name "str-agent"
           git config user.email "str-agent@users.noreply.github.com"
-          git add listings.csv seen.json || true
+          git add listings.csv seen.json alerts.csv revenue_cache.json || true
           git commit -m "Update live listings" || echo "No changes"
           git push || echo "Nothing to push"
